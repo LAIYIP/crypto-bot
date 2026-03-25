@@ -26,15 +26,17 @@ logger = logging.getLogger(__name__)
 
 try:
     binance_client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
-except:
-    logger.error("幣安 API 連接失敗")
+    logger.info("幣安 API 連接成功")
+except Exception as e:
+    logger.error(f"幣安 API 連接失敗: {e}")
     binance_client = None
 
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-except:
-    logger.error("Gemini API 連接失敗")
+    gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+    logger.info("Gemini API 連接成功")
+except Exception as e:
+    logger.error(f"Gemini API 連接失敗: {e}")
     gemini_model = None
 
 sent_signals = defaultdict(lambda: {"time": 0, "price": 0})
@@ -76,9 +78,7 @@ def analyze_ict_levels(df_1h, df_15m):
     levels = []
     if df_15m is None or len(df_15m) < 5:
         return levels
-    
     recent = df_15m.iloc[-10:].copy()
-    
     for i in range(1, len(recent)):
         curr = recent.iloc[i]
         prev = recent.iloc[i-1]
@@ -86,7 +86,6 @@ def analyze_ict_levels(df_1h, df_15m):
             levels.append({'type': '看跌 OB', 'price_high': float(curr['high']), 'price_low': float(curr['low']), 'price_mid': float((curr['high'] + curr['low']) / 2)})
         if curr['close'] > prev['close']:
             levels.append({'type': '看漲 OB', 'price_high': float(curr['high']), 'price_low': float(curr['low']), 'price_mid': float((curr['high'] + curr['low']) / 2)})
-    
     for i in range(1, len(recent) - 1):
         curr = recent.iloc[i]
         next_k = recent.iloc[i+1]
@@ -94,7 +93,6 @@ def analyze_ict_levels(df_1h, df_15m):
             levels.append({'type': 'FVG (向上)', 'price_high': float(next_k['low']), 'price_low': float(curr['high']), 'price_mid': float((next_k['low'] + curr['high']) / 2)})
         if curr['low'] > next_k['high']:
             levels.append({'type': 'FVG (向下)', 'price_high': float(curr['low']), 'price_low': float(next_k['high']), 'price_mid': float((curr['low'] + next_k['high']) / 2)})
-    
     if len(recent) >= 3:
         for i in range(2, len(recent)):
             prev2 = recent.iloc[i-2]
@@ -104,7 +102,6 @@ def analyze_ict_levels(df_1h, df_15m):
                 levels.append({'type': 'BB (新低)', 'price_high': float(prev1['low']), 'price_low': float(curr['low']), 'price_mid': float((prev1['low'] + curr['low']) / 2)})
             if curr['high'] > prev1['high'] > prev2['high']:
                 levels.append({'type': 'BB (新高)', 'price_high': float(curr['high']), 'price_low': float(prev1['high']), 'price_mid': float((curr['high'] + prev1['high']) / 2)})
-    
     return levels
 
 def get_1h_direction(df_1h):
@@ -166,19 +163,15 @@ async def auto_scan(app, chat_id):
                     df_5m = get_klines(symbol, "5m", limit=100)
                     ticker = get_ticker_info(symbol)
                     bids, asks = get_order_book(symbol)
-                    
                     if df_1h is None or df_15m is None:
                         continue
-                    
                     current_price = float(ticker.get('lastPrice', 0))
                     direction_1h = get_1h_direction(df_1h)
                     levels = analyze_ict_levels(df_1h, df_15m)
                     pattern_5m = analyze_5m_pattern(df_5m)
                     bid_strength, bid_vol, ask_vol = analyze_liquidity(bids, asks)
-                    
                     signal_key = f"{symbol}_entry"
                     current_time = time.time()
-                    
                     if pattern_5m != "普通" and bid_strength == "弱" and current_time - sent_signals[signal_key]['time'] > 600:
                         await send_signal_1(app, chat_id, symbol, direction_1h, levels, current_price, pattern_5m, bid_strength)
                         sent_signals[signal_key] = {'time': current_time, 'price': current_price}
@@ -197,6 +190,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     logger.info("正在啟動機械人...")
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("缺少 TELEGRAM_BOT_TOKEN")
+        return
     if not TELEGRAM_CHAT_ID:
         logger.error("缺少 TELEGRAM_CHAT_ID")
         return
