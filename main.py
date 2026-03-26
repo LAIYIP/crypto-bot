@@ -498,10 +498,47 @@ async def auto_scan(app, chat_id):
             nows = datetime.now(HKT).strftime('%H:%M')
             inkz, kzn = in_kill_zone()
             kzs = f"🔴 Kill Zone: {kzn}" if inkz else "⚪ 非 Kill Zone 時段"
-            await send_msg(app, chat_id,
-                f"🔍 <b>掃描運行中</b> [{nows} HKT]\n"
-                f"監控: BTC / ETH / SOL\n{kzs}"
-            )
+
+            report_lines = [
+                f"🕐 <b>每小時市場快報</b> [{nows} HKT]",
+                f"━━━━━━━━━━━━━━━━━━",
+                f"⏰ {kzs}",
+                ""
+            ]
+            for rsym in WATCH_SYMBOLS:
+                try:
+                    rd4h  = get_klines(rsym, "4h",  30)
+                    rd1h  = get_klines(rsym, "1h",  20)
+                    rd15m = get_klines(rsym, "15m", 40)
+                    rd1m  = get_klines(rsym, "1m",   5)
+                    if any(x is None for x in [rd4h, rd1h, rd15m, rd1m]):
+                        report_lines.append(f"📌 <b>{rsym.replace('USDT','/USDT')}</b>: 數據獲取失敗")
+                        continue
+                    rcp   = float(rd1m.iloc[-1]['close'])
+                    rdir4 = get_direction(rd4h, 10)
+                    rdir1 = get_direction(rd1h, 10)
+                    rzones = find_key_zones(rd15m, rdir1) if rdir1 else []
+                    dsym2 = rsym.replace('USDT', '/USDT')
+                    d4s = de(rdir4) if rdir4 else "N/A"
+                    d1s = de(rdir1) if rdir1 else "N/A"
+                    report_lines.append(f"📌 <b>{dsym2}</b>  💲{fp(rcp)}")
+                    report_lines.append(f"   4H {d4s} | 1H {d1s}")
+                    if rzones:
+                        above = [z for z in rzones if z['mid'] > rcp]
+                        below = [z for z in rzones if z['mid'] <= rcp]
+                        if below:
+                            bz = max(below, key=lambda z: z['mid'])
+                            report_lines.append(f"   🟢 支撐: {fp(bz['low'])} - {fp(bz['high'])}  ({bz['type']})")
+                        if above:
+                            az2 = min(above, key=lambda z: z['mid'])
+                            report_lines.append(f"   🔴 阻力: {fp(az2['low'])} - {fp(az2['high'])}  ({az2['type']})")
+                    else:
+                        report_lines.append(f"   ⚪ 暫無關鍵區")
+                    report_lines.append("")
+                except Exception as e:
+                    report_lines.append(f"📌 <b>{rsym.replace('USDT','/USDT')}</b>: 錯誤 {e}")
+
+            await send_msg(app, chat_id, "\n".join(report_lines))
 
         await asyncio.sleep(SCAN_INTERVAL)
 
