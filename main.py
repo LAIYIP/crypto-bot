@@ -11,6 +11,7 @@ v3.0 核心改進:
 - 假突破入場：流動性掃蕩後 CHoCH 確認
 - ATR 止損改為 1.0×ATR，最少 0.5%
 - 每小時快報加入趨勢方向、關鍵位置、當前價格
+- 入場信號加入關鍵區具體價格範圍
 """
 import logging
 import asyncio
@@ -186,14 +187,13 @@ def find_key_zones(df_15m, direction, df_1h=None, dw_levels=None):
     n = len(r)
     lc = float(r.iloc[-1]['close'])
 
-    # ── 1. Order Block（OB）需 BOS 確認 ──────────────────────────────────────
+    # ── 1. Order Block（OB）────────────────────────────────────────────────────
     for i in range(2, n - 3):
         c  = r.iloc[i]
         body_c = abs(float(c['close']) - float(c['open']))
         if body_c == 0:
             continue
 
-        # 看漲 OB：下跌中最後一根陰燭，之後急速上升突破前高
         if float(c['close']) < float(c['open']):
             prev_high = float(r.iloc[max(0,i-5):i]['high'].max()) if i > 0 else 0
             after = r.iloc[i+1:min(i+4, n)]
@@ -207,7 +207,6 @@ def find_key_zones(df_15m, direction, df_1h=None, dw_levels=None):
                         'direction': 'bullish', 'strength': 'strong'
                     })
 
-        # 看跌 OB：上升中最後一根陽燭，之後急速下跌突破前低
         if float(c['close']) > float(c['open']):
             prev_low = float(r.iloc[max(0,i-5):i]['low'].min()) if i > 0 else float('inf')
             after = r.iloc[i+1:min(i+4, n)]
@@ -221,7 +220,7 @@ def find_key_zones(df_15m, direction, df_1h=None, dw_levels=None):
                         'direction': 'bearish', 'strength': 'strong'
                     })
 
-    # ── 2. FVG（最小寬度過濾）────────────────────────────────────────────────
+    # ── 2. FVG（Fair Value Gap）────────────────────────────────────────────────
     fvg_zones = []
     for i in range(1, n - 1):
         k1 = r.iloc[i - 1]
@@ -249,174 +248,176 @@ def find_key_zones(df_15m, direction, df_1h=None, dw_levels=None):
             zones.append(z)
             fvg_zones.append(z)
 
-    # ── 3. IFVG（進入 FVG 後反轉即算）────────────────────────────────────────
+    # ── 3. IFVG（Inverse FVG）──────────────────────────────────────────────────
     for fz in fvg_zones:
         bi = fz.get('bar_idx', 0)
         subsequent = r.iloc[bi + 2:] if bi + 2 < n else pd.DataFrame()
         if subsequent.empty:
             continue
+        entered = False
+        reversed_out = False
+        for j in range(len(subsequent)):
+            row = subsequent.iloc[j]
+            rh, rl = float(row['high']), float(row['low'])
+            if fz['direction'] == 'bullish':
+                if rl <= fz['high'] and rh >= fz['low']:
+                    entered = True
+                if entered and float(row['close']) < fz['low']:
+                    reversed_out = True
+                    break
+            else:
+                if rh >= fz['low'] and rl <= fz['high']:
+                    entered = True
+                if entered and float(row['close']) > fz['high']:
+                    reversed_out = True
+                    break
+        if entered and not reversed_out:
+            inv_dir = 'bearish' if fz['direction'] == 'bullish' else 'bullish'
+            inv_label = '15M 看跌 IFVG（反轉供應區）' if inv_dir == 'bearish' else '15M 看漲 IFVG（反轉需求區）'
+            zones.append({
+                'type': 'IFVG', 'label': inv_label,
+                'high': fz['high'], 'low': fz['low'], 'mid': fz['mid'],
+                'direction': inv_dir, 'strength': 'medium'
+            })
 
-        if fz['direction'] == 'bullish':
-            for j in range(min(len(subsequent), 10)):
-                bar = subsequent.iloc[j]
-                if float(bar['low']) <= fz['high'] and float(bar['low']) >= fz['low']:
-                    if j + 1 < len(subsequent):
-                        next_bar = subsequent.iloc[j+1]
-                        if float(next_bar['close']) < fz['mid']:
-                            zones.append({
-                                'type': 'IFVG', 'label': '15M 看跌 IFVG（反轉需求缺口→阻力）',
-                                'high': fz['high'], 'low': fz['low'], 'mid': fz['mid'],
-                                'direction': 'bearish', 'strength': 'medium'
-                            })
-                            break
-        else:
-            for j in range(min(len(subsequent), 10)):
-                bar = subsequent.iloc[j]
-                if float(bar['high']) >= fz['low']:
-                    if j + 1 < len(subsequent):
-                        next_bar = subsequent.iloc[j+1]
-                        if float(next_bar['close']) > fz['mid']:
-                            zones.append({
-                                'type': 'IFVG', 'label': '15M 看漲 IFVG（反轉供應缺口→支撐）',
-                                'high': fz['high'], 'low': fz['low'], 'mid': fz['mid'],
-                                'direction': 'bullish', 'strength': 'medium'
-                            })
-                            break
+    # ── 4. SNR（Support/Resistance）──────────────────────────────────────────
+    swing_highs, swing_lows = find_swing_points_dual(r)
+    for _, ph in swing_highs[-8:]:
+        width = ph * 0.003
+        if width / lc >= MIN_ZONE_WIDTH_PCT:
+            zones.append({
+                'type': 'SNR', 'label': '15M 阻力位（SNR）',
+                'high': ph + width, 'low': ph - width,
+                'mid': ph, 'direction': 'bearish', 'strength': 'medium'
+            })
+    for _, pl in swing_lows[-8:]:
+        width = pl * 0.003
+        if width / lc >= MIN_ZONE_WIDTH_PCT:
+            zones.append({
+                'type': 'SNR', 'label': '15M 支撐位（SNR）',
+                'high': pl + width, 'low': pl - width,
+                'mid': pl, 'direction': 'bullish', 'strength': 'medium'
+            })
 
-    # ── 4. SNR（擺動高低點，雙層）──────────────────────────────────────────────
-    sh, sl = find_swing_points_dual(r)
-    for _, price in sh[-6:]:
-        zones.append({
-            'type': 'SNR', 'label': '15M 阻力 SNR',
-            'high': price * 1.0015, 'low': price * 0.9985, 'mid': price,
-            'direction': 'bearish', 'strength': 'medium'
-        })
-    for _, price in sl[-6:]:
-        zones.append({
-            'type': 'SNR', 'label': '15M 支撐 SNR',
-            'high': price * 1.0015, 'low': price * 0.9985, 'mid': price,
-            'direction': 'bullish', 'strength': 'medium'
-        })
-
-    # ── 5. Fibonacci（0.618 / 0.705 / 0.786）──────────────────────────────────
-    if sh and sl:
-        recent_lows  = sorted(sl, key=lambda x: x[0])
-        recent_highs = sorted(sh, key=lambda x: x[0])
-        if recent_lows and recent_highs:
-            rl = recent_lows[0]
-            rh = recent_highs[-1]
-            if rl[0] < rh[0] and rh[1] > rl[1]:
-                diff = rh[1] - rl[1]
-                for fib, lbl in [(0.618, "FIB 0.618"), (0.705, "FIB 0.705"), (0.786, "FIB 0.786")]:
-                    p2 = rh[1] - diff * fib
-                    zones.append({
-                        'type': 'FIB', 'label': f'15M {lbl} 回撤支撐',
-                        'high': p2 * 1.001, 'low': p2 * 0.999, 'mid': p2,
-                        'direction': 'bullish',
-                        'strength': 'strong' if fib in [0.618, 0.705] else 'medium'
-                    })
-            rh2 = recent_highs[0]
-            rl2 = recent_lows[-1]
-            if rh2[0] < rl2[0] and rh2[1] > rl2[1]:
-                diff2 = rh2[1] - rl2[1]
-                for fib, lbl in [(0.618, "FIB 0.618"), (0.705, "FIB 0.705"), (0.786, "FIB 0.786")]:
-                    p2 = rl2[1] + diff2 * fib
-                    zones.append({
-                        'type': 'FIB', 'label': f'15M {lbl} 回撤阻力',
-                        'high': p2 * 1.001, 'low': p2 * 0.999, 'mid': p2,
-                        'direction': 'bearish',
-                        'strength': 'strong' if fib in [0.618, 0.705] else 'medium'
-                    })
-
-    # ── 6. EQH / EQL（等高/等低 = 流動性池）──────────────────────────────────
-    tol = 0.002
-    for i in range(len(sh)):
-        for j in range(i + 1, len(sh)):
-            if abs(sh[i][1] - sh[j][1]) / max(sh[i][1], 0.001) < tol:
-                p2 = (sh[i][1] + sh[j][1]) / 2
+    # ── 5. FIB（0.618 / 0.705 / 0.786）──────────────────────────────────────
+    if swing_highs and swing_lows:
+        recent_high = max(ph for _, ph in swing_highs[-5:]) if swing_highs else lc
+        recent_low  = min(pl for _, pl in swing_lows[-5:])  if swing_lows  else lc
+        rng = recent_high - recent_low
+        if rng > 0:
+            for lvl, lbl in [(0.618, '0.618'), (0.705, '0.705'), (0.786, '0.786')]:
+                fib_price = recent_high - rng * lvl
+                width = fib_price * 0.002
                 zones.append({
-                    'type': 'EQH', 'label': '15M 等高點（流動性池）',
-                    'high': p2 * 1.002, 'low': p2 * 0.998, 'mid': p2,
-                    'direction': 'bearish', 'strength': 'strong'
+                    'type': 'FIB', 'label': f'15M FIB {lbl}',
+                    'high': fib_price + width, 'low': fib_price - width,
+                    'mid': fib_price,
+                    'direction': 'bullish' if fib_price < lc else 'bearish',
+                    'strength': 'medium'
                 })
-    for i in range(len(sl)):
-        for j in range(i + 1, len(sl)):
-            if abs(sl[i][1] - sl[j][1]) / max(sl[i][1], 0.001) < tol:
-                p2 = (sl[i][1] + sl[j][1]) / 2
-                zones.append({
-                    'type': 'EQL', 'label': '15M 等低點（流動性池）',
-                    'high': p2 * 1.002, 'low': p2 * 0.998, 'mid': p2,
-                    'direction': 'bullish', 'strength': 'strong'
-                })
+
+    # ── 6. EQH / EQL（Equal Highs/Lows）────────────────────────────────────
+    if len(swing_highs) >= 2:
+        for i in range(len(swing_highs) - 1):
+            for j in range(i + 1, len(swing_highs)):
+                if abs(swing_highs[i][1] - swing_highs[j][1]) / max(swing_highs[i][1], 0.001) < 0.002:
+                    ph = (swing_highs[i][1] + swing_highs[j][1]) / 2
+                    width = ph * 0.003
+                    zones.append({
+                        'type': 'EQH', 'label': '15M 等高點（EQH）流動性',
+                        'high': ph + width, 'low': ph - width,
+                        'mid': ph, 'direction': 'bearish', 'strength': 'strong'
+                    })
+    if len(swing_lows) >= 2:
+        for i in range(len(swing_lows) - 1):
+            for j in range(i + 1, len(swing_lows)):
+                if abs(swing_lows[i][1] - swing_lows[j][1]) / max(swing_lows[i][1], 0.001) < 0.002:
+                    pl = (swing_lows[i][1] + swing_lows[j][1]) / 2
+                    width = pl * 0.003
+                    zones.append({
+                        'type': 'EQL', 'label': '15M 等低點（EQL）流動性',
+                        'high': pl + width, 'low': pl - width,
+                        'mid': pl, 'direction': 'bullish', 'strength': 'strong'
+                    })
 
     # ── 7. Breaker Block ──────────────────────────────────────────────────────
-    for z in [x for x in zones if x['type'] == 'OB']:
-        if z['direction'] == 'bullish' and lc < z['low'] * 0.998:
-            zones.append({**z, 'type': 'Breaker',
-                'label': '15M 看跌 Breaker Block', 'direction': 'bearish'})
-        elif z['direction'] == 'bearish' and lc > z['high'] * 1.002:
-            zones.append({**z, 'type': 'Breaker',
-                'label': '15M 看漲 Breaker Block', 'direction': 'bullish'})
+    for i in range(5, n - 3):
+        c = r.iloc[i]
+        if float(c['close']) < float(c['open']):
+            prev_high = float(r.iloc[max(0,i-5):i]['high'].max())
+            after = r.iloc[i+1:min(i+4, n)]
+            if len(after) >= 2 and float(after['high'].max()) > prev_high:
+                later = r.iloc[i+4:min(i+10, n)]
+                if not later.empty and float(later['low'].min()) < float(c['low']):
+                    width = float(c['high']) - float(c['low'])
+                    if width / lc >= MIN_ZONE_WIDTH_PCT:
+                        zones.append({
+                            'type': 'Breaker', 'label': '15M 看跌 Breaker（反轉供應）',
+                            'high': float(c['high']), 'low': float(c['low']),
+                            'mid': float((c['high'] + c['low']) / 2),
+                            'direction': 'bearish', 'strength': 'strong'
+                        })
 
-    # ── 8. 流動性掃蕩偵測（假突破）────────────────────────────────────────────
-    recent5 = r.iloc[-5:]
-    for z in [x for x in zones if x['type'] in ['EQH', 'EQL', 'SNR']]:
-        swept = False
-        reversed_after = False
-        for i in range(len(recent5)):
-            bar = recent5.iloc[i]
-            if z['direction'] == 'bearish':
-                if float(bar['high']) > z['high'] and float(bar['close']) < z['high']:
-                    swept = True
-                if swept and float(bar['close']) < z['low']:
-                    reversed_after = True
-            else:
-                if float(bar['low']) < z['low'] and float(bar['close']) > z['low']:
-                    swept = True
-                if swept and float(bar['close']) > z['high']:
-                    reversed_after = True
-        if swept:
-            sweep_dir = 'bullish' if z['direction'] == 'bearish' else 'bearish'
-            label = f"假突破 {'↓ 看跌' if sweep_dir == 'bearish' else '↑ 看漲'}（{z['type']}）"
+    # ── 8. 流動性掃蕩（Liquidity Sweep）────────────────────────────────────
+    for i in range(5, n - 1):
+        c = r.iloc[i]
+        prev_highs = [float(r.iloc[j]['high']) for j in range(max(0,i-10), i)]
+        prev_lows  = [float(r.iloc[j]['low'])  for j in range(max(0,i-10), i)]
+        if not prev_highs or not prev_lows:
+            continue
+        max_prev_h = max(prev_highs)
+        min_prev_l = min(prev_lows)
+
+        if float(c['high']) > max_prev_h and float(c['close']) < max_prev_h:
             zones.append({
-                'type': 'Sweep', 'label': label,
-                'high': z['high'], 'low': z['low'], 'mid': z['mid'],
-                'direction': sweep_dir, 'strength': 'strong',
-                'reversed': reversed_after
+                'type': 'Sweep', 'label': '15M 假突破高點（流動性掃蕩）',
+                'high': float(c['high']), 'low': max_prev_h,
+                'mid': (float(c['high']) + max_prev_h) / 2,
+                'direction': 'bearish', 'strength': 'strong', 'reversed': True
+            })
+        if float(c['low']) < min_prev_l and float(c['close']) > min_prev_l:
+            zones.append({
+                'type': 'Sweep', 'label': '15M 假突破低點（流動性掃蕩）',
+                'high': min_prev_l, 'low': float(c['low']),
+                'mid': (min_prev_l + float(c['low'])) / 2,
+                'direction': 'bullish', 'strength': 'strong', 'reversed': True
             })
 
-    # ── 9. 跨時間框架 SNR（1H 映射到 15M）────────────────────────────────────
-    if df_1h is not None and len(df_1h) >= 10:
-        sh1h, sl1h = find_swing_points(df_1h.iloc[-50:].reset_index(drop=True), n=3)
-        for _, price in sh1h[-4:]:
+    # ── 9. 跨時間框架 SNR（1H）──────────────────────────────────────────────
+    if df_1h is not None and len(df_1h) >= 20:
+        h1_highs, h1_lows = find_swing_points_dual(df_1h.iloc[-50:])
+        for _, ph in h1_highs[-5:]:
+            width = ph * 0.004
             zones.append({
-                'type': 'HTF_SNR', 'label': '1H 阻力（跨時間框架）',
-                'high': price * 1.002, 'low': price * 0.998, 'mid': price,
-                'direction': 'bearish', 'strength': 'strong'
+                'type': 'HTF_SNR', 'label': '1H 阻力位（跨時間框架）',
+                'high': ph + width, 'low': ph - width,
+                'mid': ph, 'direction': 'bearish', 'strength': 'strong'
             })
-        for _, price in sl1h[-4:]:
+        for _, pl in h1_lows[-5:]:
+            width = pl * 0.004
             zones.append({
-                'type': 'HTF_SNR', 'label': '1H 支撐（跨時間框架）',
-                'high': price * 1.002, 'low': price * 0.998, 'mid': price,
-                'direction': 'bullish', 'strength': 'strong'
+                'type': 'HTF_SNR', 'label': '1H 支撐位（跨時間框架）',
+                'high': pl + width, 'low': pl - width,
+                'mid': pl, 'direction': 'bullish', 'strength': 'strong'
             })
 
-    # ── 10. PDH/PDL/PWH/PWL/日開盤/週開盤 ────────────────────────────────────
+    # ── 10. PDH/PDL/PWH/PWL/DO/WO ───────────────────────────────────────────
     if dw_levels:
-        mapping = [
-            ('PDH', '前日高點 PDH', 'strong'),
-            ('PDL', '前日低點 PDL', 'strong'),
-            ('PWH', '前週高點 PWH', 'strong'),
-            ('PWL', '前週低點 PWL', 'strong'),
-            ('DO',  '今日開盤 DO',  'medium'),
-            ('WO',  '本週開盤 WO',  'medium'),
-        ]
-        for key, label, strength in mapping:
-            if key in dw_levels:
-                price = dw_levels[key]
-                actual_dir = 'bearish' if lc > price else 'bullish'
+        for key, lbl, d in [
+            ('PDH', '前日高點（PDH）', 'bearish'),
+            ('PDL', '前日低點（PDL）', 'bullish'),
+            ('PWH', '前週高點（PWH）', 'bearish'),
+            ('PWL', '前週低點（PWL）', 'bullish'),
+            ('DO',  '今日開盤（DO）',  None),
+            ('WO',  '本週開盤（WO）',  None),
+        ]:
+            price = dw_levels.get(key)
+            if price:
+                width = price * 0.002
+                actual_dir = d if d else ('bearish' if price > lc else 'bullish')
+                strength = 'strong' if key in ('PDH','PDL','PWH','PWL') else 'medium'
                 zones.append({
-                    'type': key, 'label': label,
+                    'type': key, 'label': lbl,
                     'high': price * 1.001, 'low': price * 0.999, 'mid': price,
                     'direction': actual_dir, 'strength': strength
                 })
@@ -434,7 +435,6 @@ def find_key_zones(df_15m, direction, df_1h=None, dw_levels=None):
     deduped.sort(key=lambda z: abs(z['mid'] - lc))
     return deduped
 
-
 # ── TP 區域 ───────────────────────────────────────────────────────────────────
 def find_tp_zone(entry_price, direction, df_15m, df_1h=None, dw_levels=None):
     opp = 'bearish' if direction == 'bullish' else 'bullish'
@@ -449,15 +449,13 @@ def find_tp_zone(entry_price, direction, df_15m, df_1h=None, dw_levels=None):
         below = [z for z in opp_zones if z['mid'] < entry_price * 0.995]
         return max(below, key=lambda z: z['mid']) if below else None
 
-
 def assess_tp_strength(tp_zone):
     if not tp_zone:
         return "未知"
     if tp_zone['type'] in ['OB', 'EQH', 'EQL', 'Breaker', 'HTF_SNR', 'PWH', 'PWL', 'PDH', 'PDL'] \
-            or tp_zone.get('strength') == 'strong':
+       or tp_zone.get('strength') == 'strong':
         return "強（謹慎，價格可能提前反轉）"
     return "中等"
-
 
 # ── SL 計算（ATR 緩衝，最少 0.5%）────────────────────────────────────────────
 def calc_sl_tp(entry, zone, direction, df_15m, tp_zone=None):
@@ -487,7 +485,6 @@ def calc_sl_tp(entry, zone, direction, df_15m, tp_zone=None):
 
     return round(sl, 4), round(tp, 4)
 
-
 # ── 1M 結構偵測（CHoCH / BOS）────────────────────────────────────────────────
 def check_1m_structure(df_1m, direction):
     if df_1m is None or len(df_1m) < 10:
@@ -516,32 +513,37 @@ def check_1m_structure(df_1m, direction):
             return "choch", cp
     return "none", 0
 
-
 # ── 5M 形態偵測 ───────────────────────────────────────────────────────────────
 def check_5m_pattern(df_5m):
     if df_5m is None or len(df_5m) < 3:
         return "普通", None
-    c, p = df_5m.iloc[-1], df_5m.iloc[-2]
-    body = abs(float(c['close']) - float(c['open']))
-    uw   = float(c['high']) - max(float(c['close']), float(c['open']))
-    lw   = min(float(c['close']), float(c['open'])) - float(c['low'])
-    pb   = abs(float(p['close']) - float(p['open']))
-    if body == 0:
-        return "普通", None
-    if float(c['open']) > float(p['close']) and float(c['close']) < float(p['open']) and body > pb:
-        return "看跌吞沒", "bearish"
-    if float(c['open']) < float(p['close']) and float(c['close']) > float(p['open']) and body > pb:
-        return "看漲吞沒", "bullish"
-    if uw > body * 2 and lw < body * 0.5 and float(c['close']) < float(c['open']):
-        return "射擊之星", "bearish"
-    if lw > body * 2 and uw < body * 0.5 and float(c['close']) > float(c['open']):
-        return "錘子線", "bullish"
-    if uw > body * 3:
-        return "Pin Bar（看跌）", "bearish"
-    if lw > body * 3:
-        return "Pin Bar（看漲）", "bullish"
-    return "普通", None
+    last3 = df_5m.iloc[-3:]
+    c0 = last3.iloc[-3]
+    c1 = last3.iloc[-2]
+    c2 = last3.iloc[-1]
+    o2, h2, l2, cl2 = float(c2['open']), float(c2['high']), float(c2['low']), float(c2['close'])
+    o1, h1, l1, cl1 = float(c1['open']), float(c1['high']), float(c1['low']), float(c1['close'])
+    o0, cl0 = float(c0['open']), float(c0['close'])
+    body2 = abs(cl2 - o2)
+    body1 = abs(cl1 - o1)
+    upper_wick2 = h2 - max(o2, cl2)
+    lower_wick2 = min(o2, cl2) - l2
 
+    if cl1 < o1 and cl2 > o2 and cl2 > o1 and o2 < cl1:
+        return "看漲吞沒", "bullish"
+    if cl1 > o1 and cl2 < o2 and cl2 < o1 and o2 > cl1:
+        return "看跌吞沒", "bearish"
+    if lower_wick2 > body2 * 2 and upper_wick2 < body2 * 0.5:
+        return "錘子線", "bullish"
+    if upper_wick2 > body2 * 2 and lower_wick2 < body2 * 0.5:
+        return "射擊之星", "bearish"
+    if upper_wick2 > body2 * 2 and lower_wick2 > body2 * 2:
+        return "Pin Bar", "bullish" if cl2 > o2 else "bearish"
+    if cl0 < o0 and cl1 < o1 and cl2 > o2 and cl2 > (o0 + cl0) / 2:
+        return "早晨之星", "bullish"
+    if cl0 > o0 and cl1 > o1 and cl2 < o2 and cl2 < (o0 + cl0) / 2:
+        return "黃昏之星", "bearish"
+    return "普通", None
 
 # ── 輔助函數 ──────────────────────────────────────────────────────────────────
 async def send_msg(app, chat_id, text):
@@ -568,37 +570,6 @@ def entry_type_label(et):
     return "入場"
 
 
-# ── 留意信號發送 ──────────────────────────────────────────────────────────────
-async def _send_alert(app, chat_id, dsym, dir4, dir1, az, cp, kzs, reason, entry_dir, entry_type):
-    if entry_dir == 'bullish':
-        guide_in  = f"{fp(az['high'])} 以上站穩 → 考慮做多"
-        guide_out = f"跌破 {fp(az['low'])} → 關鍵區失守，暫不入場"
-    else:
-        guide_in  = f"{fp(az['low'])} 以下站穩 → 考慮做空"
-        guide_out = f"升破 {fp(az['high'])} → 關鍵區失守，暫不入場"
-
-    type_icon = {"trend": "📈 順勢", "reversal": "🔄 逆向反轉", "sweep": "⚡ 假突破反轉"}.get(entry_type, "")
-
-    await app.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"⚠️ <b>【留意信號】{dsym}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>4H:</b> {de(dir4)}  |  <b>1H:</b> {de(dir1)}\n"
-            f"{reason}\n\n"
-            f"🎯 <b>關鍵區域:</b> {az['label']}\n"
-            f"📍 <b>區域範圍:</b> {fp(az['low'])} - {fp(az['high'])}\n"
-            f"💲 <b>當前價格:</b> {fp(cp)}\n"
-            f"🏷️ <b>入場類型:</b> {type_icon}\n\n"
-            f"📌 <b>操作指引:</b>\n"
-            f"• {guide_in}\n"
-            f"• {guide_out}\n\n"
-            f"⏰ {kzs}  |  <i>等待 1M CHoCH 確認...</i>"
-        ),
-        parse_mode='HTML'
-    )
-
-
 # ── 主掃描循環 ────────────────────────────────────────────────────────────────
 async def auto_scan(app, chat_id):
     logger.info("自動掃描已啟動 v3.0")
@@ -613,6 +584,7 @@ async def auto_scan(app, chat_id):
         "  • 雙向偵測（順勢 + 逆向反轉）\n"
         "  • 假突破入場\n"
         "  • SL = 關鍵區外 + 1.0×ATR（最少 0.5%）\n"
+        "  • 入場信號顯示關鍵區具體價格範圍\n"
         "⏰ 每 60 秒掃描\n"
         "🌐 數據源: Binance 公開 API"
     )
@@ -644,7 +616,7 @@ async def auto_scan(app, chat_id):
                     inkz, kzn = in_kill_zone()
                     kzs  = f"🔴 {kzn}" if inkz else "⚪ 非 KZ"
 
-                    # 重置：價格離開活躍區域
+                    # ── 重置：價格離開活躍區域 ────────────────────────────────
                     if st["active_zone"] and st["state"] == 1:
                         z = st["active_zone"]
                         if cp < z['low'] * 0.994 or cp > z['high'] * 1.006:
@@ -653,22 +625,21 @@ async def auto_scan(app, chat_id):
                     if st["state"] == 0 and now - st["last_signal_time"] < 5400:
                         continue
 
-                    # 取得所有關鍵區
+                    # ── 取得所有關鍵區 ────────────────────────────────────────
                     all_zones = find_key_zones(d15m, dir1, df_1h=d1h, dw_levels=dw)
 
-                    trend_zones    = [z for z in all_zones if z['direction'] == dir1]
-                    opp_dir        = 'bearish' if dir1 == 'bullish' else 'bullish'
+                    trend_zones = [z for z in all_zones if z['direction'] == dir1]
+                    opp_dir = 'bearish' if dir1 == 'bullish' else 'bullish'
                     reversal_zones = [z for z in all_zones if z['direction'] == opp_dir]
-                    sweep_zones    = [z for z in all_zones if z['type'] == 'Sweep']
+                    sweep_zones = [z for z in all_zones if z['type'] == 'Sweep']
 
-                    trend_az    = next((z for z in trend_zones    if z['low'] * 0.999 <= cp <= z['high'] * 1.001), None)
+                    trend_az   = next((z for z in trend_zones   if z['low'] * 0.999 <= cp <= z['high'] * 1.001), None)
                     reversal_az = next((z for z in reversal_zones if z['low'] * 0.999 <= cp <= z['high'] * 1.001), None)
-                    sweep_az    = next((z for z in sweep_zones    if z['low'] * 0.999 <= cp <= z['high'] * 1.001), None)
+                    sweep_az   = next((z for z in sweep_zones   if z['low'] * 0.999 <= cp <= z['high'] * 1.001), None)
 
-                    # State 0：偵測入場機會
+                    # ── State 0：偵測入場機會 ─────────────────────────────────
                     if st["state"] == 0:
 
-                        # 優先級 1：假突破反轉（最高信心）
                         if sweep_az and sweep_az.get('reversed'):
                             entry_dir = sweep_az['direction']
                             reason = (f"⚡ <b>假突破反轉</b>：{sweep_az['label']}\n"
@@ -679,19 +650,17 @@ async def auto_scan(app, chat_id):
                                        "direction": entry_dir, "entry_type": "sweep",
                                        "last_signal_time": now})
 
-                        # 優先級 2：順勢入場
                         elif trend_az:
                             align = ("✅ 4H 同 1H 方向一致（強信號）" if dir4 == dir1
                                      else "⚠️ 1H 逆 4H 回調（目標 4H 關鍵區）")
                             reason = (f"{align}\n"
-                                      f"進入{'需求' if dir1 == 'bullish' else '供應'}區，等待 1M CHoCH 確認")
+                                      f"進入 {dir1 == 'bullish' and '需求' or '供應'}區，等待 1M CHoCH 確認")
                             await _send_alert(app, chat_id, dsym, dir4, dir1, trend_az,
                                               cp, kzs, reason, dir1, "trend")
                             st.update({"state": 1, "active_zone": trend_az,
                                        "direction": dir1, "entry_type": "trend",
                                        "last_signal_time": now})
 
-                        # 優先級 3：逆向反轉（只在強關鍵區）
                         elif reversal_az and reversal_az.get('strength') == 'strong':
                             rev_dir = reversal_az['direction']
                             reason = (f"🔄 <b>逆向反轉機會</b>（{reversal_az['type']}）\n"
@@ -703,7 +672,7 @@ async def auto_scan(app, chat_id):
                                        "direction": rev_dir, "entry_type": "reversal",
                                        "last_signal_time": now})
 
-                    # State 1：等待 1M CHoCH
+                    # ── State 1：等待 1M CHoCH ────────────────────────────────
                     elif st["state"] == 1:
                         az = st["active_zone"]
                         if az and (az['low'] * 0.997 <= cp <= az['high'] * 1.003):
@@ -730,6 +699,7 @@ async def auto_scan(app, chat_id):
                                     f"• {kzs}\n"
                                     f"• {struct_label}\n"
                                     f"• 關鍵區: {az['label']}\n"
+                                    f"• 關鍵區範圍: {fp(az['low'])} - {fp(az['high'])}\n"
                                     f"• 入場類型: {etl}\n\n"
                                     f"📈 <b>交易方向:</b> {ds}\n\n"
                                     f"💵 <b>入場價格:</b> {fp(cp)}\n"
@@ -748,7 +718,7 @@ async def auto_scan(app, chat_id):
                                 }
                                 st.update({"state": 2, "order_id": oid, "last_signal_time": now})
 
-                    # State 2：監控持倉
+                    # ── State 2：監控持倉 ─────────────────────────────────────
                     elif st["state"] == 2:
                         oid = st["order_id"]
                         if oid and oid in active_orders:
@@ -794,7 +764,7 @@ async def auto_scan(app, chat_id):
                                         )
                                         o["tp_alerted"] = True
 
-                    # 5M 形態確認
+                    # ── 5M 形態確認 ───────────────────────────────────────────
                     if st["state"] in [1, 2]:
                         pat, pdir = check_5m_pattern(d5m)
                         if (pat != "普通" and pdir == st.get("direction") and
@@ -817,7 +787,7 @@ async def auto_scan(app, chat_id):
         except Exception as e:
             logger.error(f"主循環失敗: {e}", exc_info=True)
 
-        # 每小時市場快報
+        # ── 每小時市場快報 ────────────────────────────────────────────────────
         hb += 1
         if hb >= 60:
             hb = 0
@@ -836,43 +806,35 @@ async def auto_scan(app, chat_id):
                     rd4h  = get_klines(rsym, "4h",  30)
                     rd1h  = get_klines(rsym, "1h",  50)
                     rd15m = get_klines(rsym, "15m", 200)
-                    rd1m  = get_klines(rsym, "1m",   5)
+                    rd1m  = get_klines(rsym, "1m",  5)
                     rdw   = get_daily_weekly_levels(rsym)
-                    if any(x is None for x in [rd4h, rd1h, rd15m, rd1m]):
-                        lines.append(f"📌 <b>{rsym.replace('USDT','/USDT')}</b>: 數據獲取失敗")
+                    if rd1m is None:
                         continue
-
                     rcp   = float(rd1m.iloc[-1]['close'])
-                    rdir4 = get_direction(rd4h, 10)
-                    rdir1 = get_direction(rd1h, 10)
-                    dsym2 = rsym.replace('USDT', '/USDT')
+                    rdir4 = get_direction(rd4h, 10) if rd4h is not None else None
+                    rdir1 = get_direction(rd1h, 10) if rd1h is not None else None
+                    rdsym = rsym.replace("USDT", "/USDT")
 
-                    d4s = de(rdir4) if rdir4 else "N/A"
-                    d1s = de(rdir1) if rdir1 else "N/A"
-
+                    lines.append(f"📌 <b>{rdsym}</b>  💲{fp(rcp)}")
                     if rdir4 and rdir1:
-                        trend_note = "✅ 同向" if rdir4 == rdir1 else "⚠️ 背離"
-                    else:
-                        trend_note = ""
+                        lines.append(f"   4H {de(rdir4)} | 1H {de(rdir1)}")
 
-                    lines.append(f"📌 <b>{dsym2}</b>  💲{fp(rcp)}")
-                    lines.append(f"   4H {d4s} | 1H {d1s}  {trend_note}")
+                    pdh = rdw.get('PDH')
+                    pdl = rdw.get('PDL')
+                    pwh = rdw.get('PWH')
+                    pwl = rdw.get('PWL')
+                    do  = rdw.get('DO')
+                    if pdh and pdl:
+                        lines.append(f"   📅 前日: 高 {fp(pdh)} / 低 {fp(pdl)}")
+                    if pwh and pwl:
+                        lines.append(f"   📆 前週: 高 {fp(pwh)} / 低 {fp(pwl)}")
+                    if do:
+                        lines.append(f"   🔵 今日開盤: {fp(do)}")
 
-                    if rdw:
-                        pdh = rdw.get('PDH'); pdl = rdw.get('PDL')
-                        pwh = rdw.get('PWH'); pwl = rdw.get('PWL')
-                        do  = rdw.get('DO')
-                        if pdh and pdl:
-                            lines.append(f"   📅 前日: 高 {fp(pdh)} / 低 {fp(pdl)}")
-                        if pwh and pwl:
-                            lines.append(f"   📆 前週: 高 {fp(pwh)} / 低 {fp(pwl)}")
-                        if do:
-                            lines.append(f"   🔵 今日開盤: {fp(do)}")
-
-                    if rdir1:
+                    if rdir1 and rd15m is not None:
                         rzones = find_key_zones(rd15m, rdir1, df_1h=rd1h, dw_levels=rdw)
-                        above  = [z for z in rzones if z['mid'] > rcp and z['direction'] == 'bearish']
-                        below  = [z for z in rzones if z['mid'] <= rcp and z['direction'] == 'bullish']
+                        above = [z for z in rzones if z['mid'] > rcp and z['direction'] == 'bearish']
+                        below = [z for z in rzones if z['mid'] <= rcp and z['direction'] == 'bullish']
                         if below:
                             bz = max(below, key=lambda z: z['mid'])
                             lines.append(f"   🟢 最近支撐: {fp(bz['low'])}-{fp(bz['high'])} [{bz['type']}]")
@@ -884,12 +846,35 @@ async def auto_scan(app, chat_id):
                     lines.append("")
 
                 except Exception as e:
-                    lines.append(f"📌 <b>{rsym.replace('USDT','/USDT')}</b>: 錯誤 {e}")
+                    lines.append(f"📌 {rsym.replace('USDT','/USDT')}: 錯誤 {e}")
 
             await send_msg(app, chat_id, "\n".join(lines))
 
         await asyncio.sleep(SCAN_INTERVAL)
 
+# ── _send_alert（留意信號）────────────────────────────────────────────────────
+async def _send_alert(app, chat_id, dsym, dir4, dir1, zone, cp, kzs, reason, entry_dir, entry_type):
+    ds = "🟢 看漲（等待做多）" if entry_dir == "bullish" else "🔴 看跌（等待做空）"
+    op_dir = "以上站穩" if entry_dir == "bullish" else "以下站穩"
+    op_break = "跌破" if entry_dir == "bullish" else "升破"
+    op_price_entry = fp(zone['low']) if entry_dir == "bullish" else fp(zone['high'])
+    op_price_break = fp(zone['high']) if entry_dir == "bullish" else fp(zone['low'])
+    etl = entry_type_label(entry_type)
+
+    await send_msg(app, chat_id,
+        f"⚠️ <b>【留意信號】{dsym}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 4H: {de(dir4)}  |  1H: {de(dir1)}\n"
+        f"{reason}\n\n"
+        f"🎯 <b>關鍵區域:</b> {zone['label']}\n"
+        f"📍 <b>區域範圍:</b> {fp(zone['low'])} - {fp(zone['high'])}\n"
+        f"💲 <b>當前價格:</b> {fp(cp)}\n\n"
+        f"📌 <b>操作指引:</b>\n"
+        f"• {op_price_entry} {op_dir} → 考慮{entry_dir == 'bullish' and '做多' or '做空'}\n"
+        f"• {op_break} {op_price_break} → 關鍵區失守，暫不入場\n\n"
+        f"⏰ {kzs}  |  等待 1M CHoCH 確認...\n"
+        f"📋 入場類型: {etl}"
+    )
 
 # ── Telegram 指令處理 ─────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
