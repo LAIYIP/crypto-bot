@@ -842,96 +842,90 @@ def format_hourly_report(results: list) -> str:
     msg += "━━━━━━━━━━━━━━━━━━\n\n"
 
     for result in results:
-        if result.get("error"):
-            continue
-        symbol    = result["symbol"]
-        sym_short = symbol.replace("USDT", "/USDT")
-        price     = result["price"]
-        struct_1h = result.get("struct_1h", "ranging")
-        struct_emoji = "⬇️ 看跌" if struct_1h == "bearish" else "⬆️ 看漲" if struct_1h == "bullish" else "↔️ 橫盤"
-        levels    = result.get("levels", {})
-        bsl       = result.get("bsl")
-        ssl       = result.get("ssl")
-        fib_1h    = result.get("fib_1h")
-        zones_15m = result.get("zones_15m", [])
+        try:
+            if result.get("error"):
+                msg += f"📌 {result.get('symbol','?').replace('USDT','/USDT')}  ⚠️ 數據錯誤: {result['error']}\n\n"
+                continue
+            symbol    = result["symbol"]
+            sym_short = symbol.replace("USDT", "/USDT")
+            price     = result["price"]
+            struct_1h = result.get("struct_1h", "ranging")
+            struct_emoji = "⬇️ 看跌" if struct_1h == "bearish" else "⬆️ 看漲" if struct_1h == "bullish" else "↔️ 橫盤"
+            levels    = result.get("levels", {})
+            bsl       = result.get("bsl")
+            ssl       = result.get("ssl")
+            fib_1h    = result.get("fib_1h")
+            zones_15m = result.get("zones_15m", [])
 
-        msg += f"📌 {sym_short}  💲{fmt(price, symbol)}  |  1H {struct_emoji}\n"
+            msg += f"📌 {sym_short}  💲{fmt(price, symbol)}  |  1H {struct_emoji}\n"
 
-        # ── 收集所有關鍵位，統一排序 ──────────────────
-        all_levels = []  # (price, label, emoji)
+            # 強位（高時間框架）→ 🔴 阻力 / 🟢 支撐
+            # 弱位（15M 流動性）→ 🟠 阻力 / 🔵 支撐
+            strong_levels = []
+            weak_levels   = []
 
-        # 強位（高時間框架）→ 🔴 阻力 / 🟢 支撐（按位置動態決定）
-        # 弱位（15M 流動性）→ 🟠 阻力 / 🔵 支撐（按位置動態決定）
-        # 先收集所有位置，排序後再按位置決定顏色
+            if levels.get('PWH'):
+                strong_levels.append((levels['PWH'], 'PWH 前週高'))
+            if levels.get('PWL'):
+                strong_levels.append((levels['PWL'], 'PWL 前週低'))
+            if levels.get('PDH'):
+                strong_levels.append((levels['PDH'], 'PDH 前日高'))
+            if levels.get('PDL'):
+                strong_levels.append((levels['PDL'], 'PDL 前日低'))
+            if levels.get('WO'):
+                strong_levels.append((levels['WO'], 'WO 週開盤'))
+            if levels.get('DO'):
+                strong_levels.append((levels['DO'], 'DO 日開盤'))
+            if fib_1h:
+                for k, lbl in [('0.618', 'FIB 0.618 OTE'), ('0.705', 'FIB 0.705 OTE'), ('0.786', 'FIB 0.786 OTE')]:
+                    v = fib_1h.get(k, 0)
+                    if v > 0:
+                        strong_levels.append((v, lbl))
 
-        strong_levels = []  # (price, label) 強位
-        weak_levels   = []  # (price, label) 弱位
+            if bsl:
+                weak_levels.append((bsl, 'BSL 上方流動性'))
+            if ssl:
+                weak_levels.append((ssl, 'SSL 下方流動性'))
 
-        # 強位：PWH/PWL/PDH/PDL/WO/DO/1H FIB OTE
-        if levels.get('PWH'):
-            strong_levels.append((levels['PWH'], 'PWH 前週高'))
-        if levels.get('PWL'):
-            strong_levels.append((levels['PWL'], 'PWL 前週低'))
-        if levels.get('PDH'):
-            strong_levels.append((levels['PDH'], 'PDH 前日高'))
-        if levels.get('PDL'):
-            strong_levels.append((levels['PDL'], 'PDL 前日低'))
-        if levels.get('WO'):
-            strong_levels.append((levels['WO'], 'WO 週開盤'))
-        if levels.get('DO'):
-            strong_levels.append((levels['DO'], 'DO 日開盤'))
-        if fib_1h:
-            for k, lbl in [('0.618', 'FIB 0.618 OTE'), ('0.705', 'FIB 0.705 OTE'), ('0.786', 'FIB 0.786 OTE')]:
-                v = fib_1h.get(k, 0)
-                if v > 0:
-                    strong_levels.append((v, lbl))
+            bear_zones = sorted(
+                [z for z in zones_15m if z.get('mid', 0) > price],
+                key=lambda z: z.get('mid', float('inf'))
+            )[:3]
+            bull_zones = sorted(
+                [z for z in zones_15m if z.get('mid', 0) < price],
+                key=lambda z: z.get('mid', 0),
+                reverse=True
+            )[:3]
+            for z in bear_zones:
+                lbl = f"{z.get('label', '關鍵區')} {fmt(z.get('low',0), symbol)}-{fmt(z.get('high',0), symbol)}"
+                weak_levels.append((z.get('mid', 0), lbl))
+            for z in bull_zones:
+                lbl = f"{z.get('label', '關鍵區')} {fmt(z.get('low',0), symbol)}-{fmt(z.get('high',0), symbol)}"
+                weak_levels.append((z.get('mid', 0), lbl))
 
-        # 弱位：BSL/SSL + 15M 關鍵區（上方最近 3 個 + 下方最近 3 個）
-        if bsl:
-            weak_levels.append((bsl, 'BSL 上方流動性'))
-        if ssl:
-            weak_levels.append((ssl, 'SSL 下方流動性'))
+            all_levels = [(p, lbl, 'strong') for p, lbl in strong_levels] + \
+                         [(p, lbl, 'weak')   for p, lbl in weak_levels]
+            all_levels.sort(key=lambda x: x[0])
 
-        bear_zones = sorted(
-            [z for z in zones_15m if z.get('mid', 0) > price],
-            key=lambda z: z.get('mid', float('inf'))
-        )[:3]
-        bull_zones = sorted(
-            [z for z in zones_15m if z.get('mid', 0) < price],
-            key=lambda z: z.get('mid', 0),
-            reverse=True
-        )[:3]
-        for z in bear_zones:
-            lbl = f"{z.get('label', '關鍵區')} {fmt(z.get('low',0), symbol)}-{fmt(z.get('high',0), symbol)}"
-            weak_levels.append((z.get('mid', 0), lbl))
-        for z in bull_zones:
-            lbl = f"{z.get('label', '關鍵區')} {fmt(z.get('low',0), symbol)}-{fmt(z.get('high',0), symbol)}"
-            weak_levels.append((z.get('mid', 0), lbl))
+            insert_idx = next((i for i, (p, _, _) in enumerate(all_levels) if p > price), len(all_levels))
+            above = all_levels[insert_idx:]
+            below = all_levels[:insert_idx]
 
-        # ── 合併並排序 ──────────────────────────────
-        all_levels = [(p, lbl, 'strong') for p, lbl in strong_levels] +                      [(p, lbl, 'weak')   for p, lbl in weak_levels]
-        all_levels.sort(key=lambda x: x[0])
+            for p, lbl, strength in above:
+                emoji = '🔴' if strength == 'strong' else '🟠'
+                msg += f"   {emoji} {fmt(p, symbol)}  {lbl}\n"
 
-        insert_idx = next((i for i, (p, _, _) in enumerate(all_levels) if p > price), len(all_levels))
-        above = all_levels[insert_idx:]   # 高於現價（阻力）
-        below = all_levels[:insert_idx]   # 低於現價（支撐）
+            msg += f"   ──── 💲{fmt(price, symbol)} 現價 ────\n"
 
-        # 上方阻力：由近至遠（由低至高）
-        # 強位 🔴，弱位 🟠
-        for p, lbl, strength in above:
-            emoji = '🔴' if strength == 'strong' else '🟠'
-            msg += f"   {emoji} {fmt(p, symbol)}  {lbl}\n"
+            for p, lbl, strength in reversed(below):
+                emoji = '🟢' if strength == 'strong' else '🔵'
+                msg += f"   {emoji} {fmt(p, symbol)}  {lbl}\n"
 
-        # 當前價格分隔線
-        msg += f"   ──── 💲{fmt(price, symbol)} 現價 ────\n"
+            msg += "\n"
 
-        # 下方支撐：由近至遠（由高至低）
-        # 強位 🟢，弱位 🔵
-        for p, lbl, strength in reversed(below):
-            emoji = '🟢' if strength == 'strong' else '🔵'
-            msg += f"   {emoji} {fmt(p, symbol)}  {lbl}\n"
-
-        msg += "\n"
+        except Exception as e:
+            sym = result.get('symbol', '?').replace('USDT', '/USDT')
+            msg += f"📌 {sym}  ⚠️ 快報生成錯誤: {e}\n\n"
 
     return msg.rstrip()
 
