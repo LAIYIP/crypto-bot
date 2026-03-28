@@ -284,7 +284,7 @@ def find_order_blocks(df: pd.DataFrame) -> list:
                 obs.append({'type': 'OB', 'direction': 'bearish',
                             'high': float(c['high']), 'low': float(c['low']),
                             'mid': (float(c['high']) + float(c['low'])) / 2,
-                            'label': '看跌 OB（供應區）', 'strength': 'strong'})
+                            'label': 'OB−（供應區）', 'strength': 'strong'})
         elif float(c['close']) < float(c['open']):
             prev_high = float(df.iloc[max(0,i-5):i]['high'].max()) if i > 0 else 0
             after = df.iloc[i+1:min(i+4, len(df))]
@@ -292,7 +292,7 @@ def find_order_blocks(df: pd.DataFrame) -> list:
                 obs.append({'type': 'OB', 'direction': 'bullish',
                             'high': float(c['high']), 'low': float(c['low']),
                             'mid': (float(c['high']) + float(c['low'])) / 2,
-                            'label': '看漲 OB（需求區）', 'strength': 'strong'})
+                            'label': 'OB+（需求區）', 'strength': 'strong'})
     return obs
 
 def find_fvg(df: pd.DataFrame) -> list:
@@ -307,13 +307,13 @@ def find_fvg(df: pd.DataFrame) -> list:
             fvgs.append({'type': 'FVG', 'direction': 'bullish',
                          'high': float(k3['low']), 'low': float(k1['high']),
                          'mid': (float(k3['low']) + float(k1['high'])) / 2,
-                         'label': '看漲 FVG（需求缺口）', 'strength': 'medium', 'bar_idx': i})
+                         'label': 'FVG+（需求缺口）', 'strength': 'medium', 'bar_idx': i})
         gap_bear = float(k1['low']) - float(k3['high'])
         if gap_bear > 0 and gap_bear / lc >= MIN_ZONE_PCT:
             fvgs.append({'type': 'FVG', 'direction': 'bearish',
                          'high': float(k1['low']), 'low': float(k3['high']),
                          'mid': (float(k1['low']) + float(k3['high'])) / 2,
-                         'label': '看跌 FVG（供應缺口）', 'strength': 'medium', 'bar_idx': i})
+                         'label': 'FVG−（供應缺口）', 'strength': 'medium', 'bar_idx': i})
     return fvgs
 
 def find_ifvg(df: pd.DataFrame, fvg_list: list) -> list:
@@ -330,12 +330,12 @@ def find_ifvg(df: pd.DataFrame, fvg_list: list) -> list:
                 if fz['direction'] == 'bullish' and float(row['close']) < float(row['open']):
                     ifvgs.append({'type': 'IFVG', 'direction': 'bearish',
                                   'high': fz['high'], 'low': fz['low'], 'mid': fz['mid'],
-                                  'label': '看跌 IFVG（反轉 FVG）', 'strength': 'medium'})
+                                  'label': 'IFVG−（反轉供應）', 'strength': 'medium'})
                     break
                 elif fz['direction'] == 'bearish' and float(row['close']) > float(row['open']):
                     ifvgs.append({'type': 'IFVG', 'direction': 'bullish',
                                   'high': fz['high'], 'low': fz['low'], 'mid': fz['mid'],
-                                  'label': '看漲 IFVG（反轉 FVG）', 'strength': 'medium'})
+                                  'label': 'IFVG+（反轉需求）', 'strength': 'medium'})
                     break
     return ifvgs
 
@@ -1005,11 +1005,19 @@ def format_hourly_report(results: list) -> str:
                 if v and v < price and not is_dup_15m(v):
                     candidates_15m.append((float(v), lbl, 'strong'))
 
-            # 15M OB/FVG/IFVG
+            # 15M OB/FVG/IFVG（方向過濾：上方只加供應位，下方只加需求位）
             for z in zones_15m:
                 zm = z.get('mid', 0)
-                if zm and not is_dup_15m(zm):
-                    candidates_15m.append((zm, z.get('label', '15M 關鍵區'), 'weak'))
+                if not zm or is_dup_15m(zm):
+                    continue
+                zdir = z.get('direction', '')
+                lbl  = z.get('label', '15M 關鍵區')
+                # 上方位：只接受 bearish（供應）
+                if zm > price and zdir == 'bearish':
+                    candidates_15m.append((zm, lbl, 'weak'))
+                # 下方位：只接受 bullish（需求）
+                elif zm < price and zdir == 'bullish':
+                    candidates_15m.append((zm, lbl, 'weak'))
 
             above_15m = sorted([(p,l,s) for p,l,s in candidates_15m if p > price], key=lambda x: x[0])
             below_15m = sorted([(p,l,s) for p,l,s in candidates_15m if p < price], key=lambda x: x[0], reverse=True)
@@ -1018,38 +1026,68 @@ def format_hourly_report(results: list) -> str:
             near_below = below_15m[:2]
 
             # ── 重疊標記函數 ──────────────────────────────
+            # 容差收緊至 ±0.3%，前綴改為空格分隔（無 + 號避免混淆）
             def overlap_tag(p: float) -> str:
                 tags = []
-                # FIB 重疊
+                tol = 0.003  # ±0.3% 容差
+                # FIB 重疊（只取最接近的一個）
                 if fib_1h:
+                    best_fib, best_dist = None, tol
                     for k in ["0.5", "0.618", "0.705", "0.786"]:
                         fv = fib_1h.get(k, 0)
-                        if fv and abs(p - fv) / max(fv, 0.001) < 0.005:
-                            tags.append(k)
-                # 4H OB 重疊
+                        if fv:
+                            d = abs(p - fv) / max(fv, 0.001)
+                            if d < best_dist:
+                                best_dist, best_fib = d, k
+                    if best_fib:
+                        tags.append(best_fib)
+                # 4H OB 重疊（只取最接近的一個）
+                best_4h, best_dist = None, tol
                 for z in zones_4h:
                     zm = z.get('mid', 0)
-                    if zm and abs(p - zm) / max(zm, 0.001) < 0.005:
+                    if zm:
+                        d = abs(p - zm) / max(zm, 0.001)
+                        if d < best_dist:
+                            best_dist, best_4h = d, z
+                if best_4h:
+                    lbl = best_4h.get('label', '4H OB')
+                    # 簡化標籤：OB+/OB− 格式
+                    if 'OB+' in lbl or '需求' in lbl:
+                        tags.append("4H OB+")
+                    elif 'OB−' in lbl or '供應' in lbl:
+                        tags.append("4H OB−")
+                    else:
                         tags.append("4H OB")
-                        break
-                # 1H OB/FVG 重疊
+                # 1H OB/FVG 重疊（只取最接近的一個）
+                best_1h, best_dist = None, tol
                 for z in zones_1h:
                     zm = z.get('mid', 0)
-                    if zm and abs(p - zm) / max(zm, 0.001) < 0.005:
+                    if zm:
+                        d = abs(p - zm) / max(zm, 0.001)
+                        if d < best_dist:
+                            best_dist, best_1h = d, z
+                if best_1h:
+                    lbl = best_1h.get('label', '1H OB')
+                    if 'OB+' in lbl or '需求' in lbl:
+                        tags.append("1H OB+")
+                    elif 'OB−' in lbl or 'FVG−' in lbl or '供應' in lbl:
+                        tags.append("1H OB−")
+                    elif 'FVG+' in lbl:
+                        tags.append("1H FVG+")
+                    else:
                         tags.append("1H OB")
-                        break
                 # 4H EQH/EQL 重疊
                 for e in eqh_list:
                     ep = e.get('price', 0) if isinstance(e, dict) else e
-                    if ep and abs(p - ep) / max(ep, 0.001) < 0.005:
+                    if ep and abs(p - ep) / max(ep, 0.001) < tol:
                         tags.append("4H EQH")
                         break
                 for e in eql_list:
                     ep = e.get('price', 0) if isinstance(e, dict) else e
-                    if ep and abs(p - ep) / max(ep, 0.001) < 0.005:
+                    if ep and abs(p - ep) / max(ep, 0.001) < tol:
                         tags.append("4H EQL")
                         break
-                return f" [+{', '.join(tags)}]" if tags else ""
+                return f" [{', '.join(tags)}]" if tags else ""
 
             # ── 輸出 ──────────────────────────────────────
             # 最外圍上方（1H Swing High）
