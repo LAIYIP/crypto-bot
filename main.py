@@ -1196,18 +1196,9 @@ async def scheduled_analysis_loop(bot: Bot):
         await asyncio.sleep(60)  # 每分鐘檢查一次
 
 # ── 主程式 ─────────────────────────────────────────────────────────
-async def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 環境變數")
-        return
-
-    # 建立 Application（支援 MessageHandler）
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+async def post_init(app: Application) -> None:
+    """PTB 啟動後回調：發送啟動訊息並啟動背景任務"""
     bot = app.bot
-
     await send_msg(bot,
         "✅ ICT/SMC 交易信號機械人 v5.0 已啟動\n\n"
         "① 自動入場訊號：BTC / ETH / SOL（即時掃描）\n"
@@ -1216,15 +1207,30 @@ async def main():
         "④ 雙向情景：輸入「BTC分析」取得即時雙向情景\n\n"
         "🌐 數據：data-api.binance.vision"
     )
-
     logger.info("機械人 v5.0 已啟動")
+    # 在 PTB 的 event loop 內啟動背景任務（避免 event loop 衝突）
+    asyncio.create_task(signal_scan_loop(bot))
+    asyncio.create_task(scheduled_analysis_loop(bot))
 
-    # 同時運行三個異步任務
-    await asyncio.gather(
-        app.run_polling(drop_pending_updates=True),
-        signal_scan_loop(bot),
-        scheduled_analysis_loop(bot),
+
+def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID 環境變數")
+        return
+
+    # 建立 Application，用 post_init 啟動背景任務
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .build()
     )
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # run_polling 自己管理 event loop，不需要 asyncio.run()
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
