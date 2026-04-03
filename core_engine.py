@@ -839,7 +839,7 @@ def analyze_symbol(symbol: str) -> dict:
 
     # Swing points
     swings_15m = get_swing_points(klines_15m, 20)
-    swings_1h = get_swing_points(klines_1h, 20)
+    swings_1h = get_swing_points(klines_1h, 100)  # 100根1H = 約4天，捕捉完整盤整區間高低點
 
     # 3M MSS
     mss_bull = detect_3m_mss(klines_3m, "bullish")
