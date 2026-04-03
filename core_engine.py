@@ -18,39 +18,60 @@ HKT = timezone(timedelta(hours=8))
 # 資料拉取
 # ─────────────────────────────────────────
 
+# Bybit interval mapping (Binance format -> Bybit format)
+_BYBIT_INTERVAL_MAP = {
+    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
+    "1d": "D", "1w": "W",
+}
+
+
 def fetch_klines(symbol: str, interval: str, limit: int = 300) -> list[dict]:
-    """從 Binance 拉取 K 線數據"""
-    url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    """從 Bybit 拉取 K 線數據（相容 US 地區，不受 Binance 封鎖）"""
+    bybit_interval = _BYBIT_INTERVAL_MAP.get(interval, interval)
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": bybit_interval,
+        "limit": limit,
+    }
     try:
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
-        if not isinstance(data, list):
+        if data.get("retCode") != 0:
             return []
+        items = data["result"]["list"]
+        if not items:
+            return []
+        # Bybit 返回最新在前（降序），需反轉為升序
         return [
             {
-                "ts": d[0],
+                "ts": int(d[0]),
                 "open": float(d[1]),
                 "high": float(d[2]),
                 "low": float(d[3]),
                 "close": float(d[4]),
                 "volume": float(d[5]),
             }
-            for d in data
+            for d in reversed(items)
         ]
     except Exception:
         return []
 
 
 def get_current_price(symbol: str) -> float:
-    """取得現價"""
+    """取得現價（Bybit）"""
     try:
         r = requests.get(
-            "https://fapi.binance.com/fapi/v1/ticker/price",
-            params={"symbol": symbol},
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear", "symbol": symbol},
             timeout=5,
         )
-        return float(r.json()["price"])
+        data = r.json()
+        if data.get("retCode") == 0:
+            return float(data["result"]["list"][0]["lastPrice"])
+        return 0.0
     except Exception:
         return 0.0
 
@@ -651,7 +672,7 @@ def find_tp_levels(
     current_price: float,
 ) -> dict:
     """
-    搜尋 TP1（15M 小阻力，RR >= 1:1）和 TP2（1H 大關鍵位）
+    搜尋 TP1（15M 小阻力，RR ≥ 1:1）和 TP2（1H 大關鍵位）
     若 TP1 RR < 1:1，向上/下找下一個，並標注原因
     """
     sl_dist = abs(entry - sl)
@@ -708,7 +729,7 @@ def find_tp_levels(
                 rr = (entry - fvg.high) / sl_dist
                 tp1_candidates.append((fvg.high, "15M 看漲 FVG", rr))
 
-    # 排序：優先選 RR >= 1 的最近目標
+    # 排序：優先選 RR ≥ 1 的最近目標
     tp1_candidates.sort(key=lambda x: abs(x[0] - entry))
     tp2_candidates.sort(key=lambda x: abs(x[0] - entry))
 
@@ -721,9 +742,9 @@ def find_tp_levels(
             break
 
     if tp1_price == 0 and tp1_candidates:
-        # 找不到 RR >= 1 的，取最近的並標注
+        # 找不到 RR ≥ 1 的，取最近的並標注
         tp1_price, tp1_label, tp1_rr = tp1_candidates[0]
-        tp1_note = f"最近阻力位 RR 僅 1:{tp1_rr:.1f}，已選用最近可用目標"
+        tp1_note = f"⚠️ 最近阻力位 RR 僅 1:{tp1_rr:.1f}，已選用最近可用目標"
 
     if tp1_price == 0:
         # 完全找不到，用 RR 公式
@@ -733,7 +754,7 @@ def find_tp_levels(
             tp1_price = entry - sl_dist * 1.5
         tp1_label = "1:1.5 RR 目標"
         tp1_rr = 1.5
-        tp1_note = "無明顯阻力位，使用 RR 公式計算"
+        tp1_note = "⚠️ 無明顯阻力位，使用 RR 公式計算"
 
     # 選 TP2（比 TP1 更遠）
     tp2_price, tp2_label, tp2_rr = 0, "", 0
