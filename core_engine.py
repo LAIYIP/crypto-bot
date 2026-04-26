@@ -25,9 +25,10 @@ _INTERVAL_MAP = {
     "1d":  "1d",
 }
 
-def fetch_klines(symbol: str, interval: str, limit: int = 100 ) -> list:
+def fetch_klines(symbol: str, interval: str, limit: int = 100 ) -> list[dict]:
     iv = _INTERVAL_MAP.get(interval, interval)
     params = {"symbol": symbol, "interval": iv, "limit": limit}
+
     for base in _ENDPOINTS:
         try:
             url = f"{base}/api/v3/klines"
@@ -50,7 +51,6 @@ def fetch_klines(symbol: str, interval: str, limit: int = 100 ) -> list:
             continue
     return []
 
-
 def get_current_price(symbol: str) -> float:
     for base in _ENDPOINTS:
         try:
@@ -61,7 +61,6 @@ def get_current_price(symbol: str) -> float:
         except Exception:
             continue
     return 0.0
-
 
 def get_24h_stats(symbol: str) -> dict:
     for base in _ENDPOINTS:
@@ -81,11 +80,11 @@ def get_24h_stats(symbol: str) -> dict:
             continue
     return {}
 
-
 def fetch_market_data(symbol: str) -> dict:
     current_price = get_current_price(symbol)
     if current_price == 0:
         return {}
+
     return {
         "symbol":        symbol,
         "current_price": current_price,
